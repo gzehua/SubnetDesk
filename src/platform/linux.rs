@@ -1,6 +1,15 @@
 use super::{gtk_sudo, CursorData, ResultType};
 use desktop::Desktop;
 pub use hbb_common::platform::linux::*;
+
+#[cfg(feature = "drm")]
+pub fn dispatch_wayland_display_probe() {
+    use std::ffi::OsStr;
+
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WAYLAND_DISPLAY_PROBE_ARG)) {
+        wayland_display_probe_child_main();
+    }
+}
 use hbb_common::{
     allow_err,
     anyhow::anyhow,
@@ -43,8 +52,37 @@ const TERM_XTERM_256COLOR: &str = "xterm-256color";
 const TERM_SCREEN_256COLOR: &str = "screen-256color";
 const TERM_XTERM: &str = "xterm";
 
+#[cfg(feature = "drm")]
 lazy_static::lazy_static! {
-    pub static ref IS_X11: bool = hbb_common::platform::linux::is_x11_or_headless();
+    /// Only for per-frame callers; see `is_login_screen_wayland_cached`.
+    /// Own block because `#[cfg]` on one item inside a shared one breaks the macro.
+    static ref IS_LOGIN_SCREEN_WAYLAND: bool = is_login_screen_wayland();
+}
+
+lazy_static::lazy_static! {
+    /// `is_x11_or_headless()` answers x11 at a Wayland greeter, which the portal could not
+    /// serve but the DRM path can. Unmemoised lookup on purpose: this may run mid-boot, and
+    /// a "no" cached that early would be wrong for the rest of the process.
+    pub static ref IS_X11: bool = {
+        let x11 = hbb_common::platform::linux::is_x11_or_headless();
+        #[cfg(feature = "drm")]
+        {
+            if x11 && !display_server_forced() && is_login_screen_wayland() {
+                log::info!(
+                    "drm: seat0 is a Wayland login screen that reads as x11 upstream; \
+                     treating it as Wayland so the DRM path is not disabled at the one \
+                     screen it exists for"
+                );
+                false
+            } else {
+                x11
+            }
+        }
+        #[cfg(not(feature = "drm"))]
+        {
+            x11
+        }
+    };
     // Cache for TERM value - once TERM_XTERM_256COLOR is found, reuse it directly
     static ref CACHED_TERM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     static ref DATABASE_XTERM_256COLOR: Option<Database> = {
@@ -208,6 +246,34 @@ pub fn is_login_screen_wayland() -> bool {
     is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
 }
 
+/// An explicit `RUSTDESK_FORCED_DISPLAY_SERVER` is an operator override, and the root service
+/// forwards it to the per-user server on purpose: the greeter correction may only fix an
+/// AUTO-detected answer, never argue with the operator — a half-applied override would leave
+/// `get_display_server()` and the DRM routing gates disagreeing with each other.
+#[cfg(feature = "drm")]
+pub(crate) fn display_server_forced() -> bool {
+    std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER").is_ok()
+}
+
+/// X11 as far as the DRM path is concerned: a Wayland greeter is not, unless the operator
+/// forced the display server.
+///
+/// Both halves unmemoised, for the retry loops that must keep asking until seat0 can be named.
+#[cfg(feature = "drm")]
+pub fn is_x11_for_drm() -> bool {
+    scrap::is_x11() && (display_server_forced() || !is_login_screen_wayland())
+}
+
+/// Memoised `is_login_screen_wayland`, for per-frame callers that must not run `loginctl`.
+///
+/// Only from the per-session `--server`: it is spawned after the session is identified, so the
+/// answer is settled. Anything that can run mid-boot must use the uncached form.
+#[cfg(feature = "drm")]
+#[inline]
+pub fn is_login_screen_wayland_cached() -> bool {
+    *IS_LOGIN_SCREEN_WAYLAND
+}
+
 #[inline]
 fn sleep_millis(millis: u64) {
     std::thread::sleep(Duration::from_millis(millis));
@@ -361,6 +427,30 @@ pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
 }
 
 pub fn get_cursor() -> ResultType<Option<u64>> {
+    // DRM/KMS capture: the hardware cursor arrives over the `_drm` stream, not from XFixes.
+    //
+    // The MEMOISED `is_x11()` here, deliberately, unlike the capture-path callers that take the
+    // unmemoised `scrap::is_x11()` because this one latches on first use. The tradeoff is the other
+    // way round at cursor cadence: the unmemoised form forks `loginctl` per call, and this runs on
+    // every cursor poll. A latch that guessed wrong costs a cursor served by the wrong source until
+    // the process restarts, not a capture that cannot start -- and by the time a cursor is being
+    // polled there is a live session, which is the case the latch reads correctly.
+    #[cfg(feature = "drm")]
+    if !is_x11() {
+        if let Some(id) = crate::server::drm_capturer::drm_cursor_id() {
+            // In a mixed DRM + PipeWire session the DRM streams only cover the DRM-backed displays;
+            // when the pointer sits on a PipeWire-served display every DRM stream reports the hidden
+            // sentinel. Returning that sentinel here would hide the cursor globally, including on the
+            // PipeWire display where it is still visible, so only report a hidden DRM cursor when it
+            // is authoritative -- a pure-DRM session. A visible DRM cursor is always authoritative;
+            // otherwise fall through to the normal cursor path.
+            if id != scrap::drm_reader::HIDDEN_CURSOR_ID
+                || !crate::server::display_service::has_non_drm_backed_display()
+            {
+                return Ok(Some(id));
+            }
+        }
+    }
     let mut res = None;
     DISPLAY.with(|conn| {
         if let Ok(d) = conn.try_borrow_mut() {
@@ -379,6 +469,32 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
 }
 
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
+    // DRM/KMS capture: return the latest hardware-cursor snapshot from the `_drm` stream. Its id may
+    // have advanced past `hcursor` between get_cursor() and here, so return the latest rather than
+    // bailing (which would trigger a MouseCursorService backoff).
+    //
+    // Memoised `is_x11()` on purpose, for the reason spelled out in `get_cursor()`; the two must
+    // agree anyway, since a caller that took the DRM branch there has to take it here.
+    #[cfg(feature = "drm")]
+    if !is_x11() {
+        if let Some(c) = crate::server::drm_capturer::drm_cursor() {
+            // See get_cursor(): a hidden DRM sentinel is authoritative only in a pure-DRM session. In
+            // a mixed DRM + PipeWire session fall through so the PipeWire display's cursor is served
+            // by the normal path instead of being hidden everywhere.
+            if c.id != scrap::drm_reader::HIDDEN_CURSOR_ID
+                || !crate::server::display_service::has_non_drm_backed_display()
+            {
+                let mut cd: CursorData = Default::default();
+                cd.id = c.id;
+                cd.width = c.width;
+                cd.height = c.height;
+                cd.hotx = c.hotx;
+                cd.hoty = c.hoty;
+                cd.colors = c.colors.into();
+                return Ok(cd);
+            }
+        }
+    }
     let mut res = None;
     DISPLAY.with(|conn| {
         if let Ok(ref mut d) = conn.try_borrow_mut() {
@@ -646,6 +762,16 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
             if !desktop.dbus.is_empty() {
                 envs.push(("DBUS_SESSION_BUS_ADDRESS", desktop.dbus.clone()));
             }
+            if let Ok(forced_display_server) =
+                std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER")
+            {
+                if !forced_display_server.is_empty() {
+                    envs.push((
+                        "RUSTDESK_FORCED_DISPLAY_SERVER",
+                        forced_display_server,
+                    ));
+                }
+            }
             envs.push((
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
@@ -668,6 +794,40 @@ fn start_server(desktop: Option<&Desktop>, server: &mut Option<Child>) {
             log::error!("Failed to start server: {}", err);
         }
     }
+}
+
+/// Whether a just-spawned `--server` is still running after a short grace period, taking ownership of
+/// the corpse (clearing `server`) when it is not. `start_server` reports only whether the SPAWN
+/// succeeded, which is not the same question: a child that execs and exits immediately still leaves
+/// `Some(child)` behind.
+///
+/// A child that exits is detected as soon as it does; a healthy one costs the full grace, once per
+/// start. A server that dies LATER than this is a different (transient) failure, and the restart
+/// throttle in `should_start_server` already bounds that case.
+#[cfg(feature = "drm")]
+fn server_survived_grace(server: &mut Option<Child>) -> bool {
+    const GRACE: Duration = Duration::from_millis(1000);
+    const STEP_MS: u64 = 100;
+    let Some(ps) = server.as_mut() else {
+        return false; // spawn itself failed
+    };
+    let deadline = Instant::now() + GRACE;
+    while Instant::now() < deadline {
+        match ps.try_wait() {
+            Ok(Some(status)) => {
+                log::warn!("--server exited {status} within {GRACE:?} of starting");
+                *server = None;
+                return false;
+            }
+            Ok(None) => sleep_millis(STEP_MS),
+            // We cannot tell; treat it as alive rather than tearing down a possibly healthy child.
+            Err(err) => {
+                log::error!("error waiting on the just-started --server: {err}");
+                return true;
+            }
+        }
+    }
+    true
 }
 
 fn stop_server(server: &mut Option<Child>) {
@@ -800,6 +960,29 @@ pub fn start_os_service() {
         allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
     });
 
+    // DRM/KMS capture producer (opt-in `drm` feature): a dedicated thread + runtime that streams
+    // scanout frames to the user `--server` over the `_drm` service-scoped channel. Runs here
+    // because this process is the root service that already holds CAP_SYS_ADMIN for the in-process
+    // (direct-mode) libdrmtap read.
+    //
+    // Builder, like every other thread this feature starts: `thread::spawn` PANICS if the thread
+    // cannot be created (EAGAIN under a thread-count or memory limit), and here that panic would
+    // unwind out of `start_os_service` -- taking down the root service itself, for a feature whose
+    // failure should only cost DRM capture. Losing the producer leaves the consumer to fall back to
+    // PipeWire/X11, which is the same path a host without the feature takes.
+    #[cfg(feature = "drm")]
+    if let Err(err) = std::thread::Builder::new()
+        .name("drm-producer".into())
+        .spawn(|| {
+            crate::ipc::start_drm();
+        })
+    {
+        log::warn!(
+            "failed to spawn the drm capture producer thread: {err}; DRM capture is off for \
+             this boot and the consumer falls back to PipeWire/X11"
+        );
+    }
+
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     let (mut display, mut xauth): (String, String) = ("".to_owned(), "".to_owned());
@@ -838,7 +1021,38 @@ pub fn start_os_service() {
             ) {
                 stop_subprocess();
                 force_stop_server();
+                // Run the login-screen --server as the active seat0 session user (the greeter
+                // account) rather than root, so the DRM capture GPU/EGL convert never loads the
+                // vendor GPU userspace in a privileged process. is_login_wayland() matches a GDM or
+                // SDDM Wayland greeter (is_gdm_user covers both), and desktop.uid is that greeter's
+                // uid, so this drops to whichever greeter owns seat0. A greeter is_gdm_user does not
+                // recognize (e.g. LightDM) never reaches this branch -- it takes the unprivileged
+                // else-branch below already. A genuine root graphical session (username=="root")
+                // has no lower uid to drop to, so it stays root. The whole branch is gated on the drm
+                // feature, so the drm-off build is upstream's single `start_server(None, ..)` line.
+                #[cfg(not(feature = "drm"))]
                 start_server(None, &mut server);
+                #[cfg(feature = "drm")]
+                if desktop.username != "root" && !desktop.uid.is_empty() {
+                    start_server(Some(&desktop), &mut server);
+                    // If dropping to the greeter uid did not produce a RUNNING server, fall back to a
+                    // root --server so the login screen stays remotable instead of looping on a
+                    // failing greeter spawn. This pays the GPU-in-root tradeoff only on that failure
+                    // path, never in the normal greeter case. Liveness, not just spawn success: a
+                    // greeter account that cannot actually run it (a nologin shell, a hardened home,
+                    // no writable config dir) leaves a child that exits at once, and the loop above
+                    // notices only that the child is gone and respawns it, forever, without ever
+                    // reaching this fallback -- so the login screen becomes permanently un-remotable
+                    // on a host where it used to work.
+                    if !server_survived_grace(&mut server) {
+                        log::warn!(
+                            "greeter --server did not stay up; falling back to a root --server"
+                        );
+                        start_server(None, &mut server);
+                    }
+                } else {
+                    start_server(None, &mut server);
+                }
             }
         } else if desktop.username != "" {
             // try kill subprocess "--server"
@@ -914,7 +1128,21 @@ pub fn get_active_userid() -> String {
 #[inline]
 /// Returns the active uid from a fresh seat0 lookup, bypassing the service-loop cache.
 pub fn get_active_userid_fresh() -> String {
+    // A Wayland greeter owns seat0 while it is up and the DRM backend serves it, so a uid gate that
+    // cannot see it rejects the greeter's own `--server`. `Desktop::refresh` reads it the same way.
+    #[cfg(feature = "drm")]
+    return get_values_of_seat0_with_gdm_wayland(&[1])[0].clone();
+    #[cfg(not(feature = "drm"))]
     get_values_of_seat0(&[1])[0].clone()
+}
+
+#[inline]
+/// The cached active uid as a number, or `None` when the cache is empty. Unlike `get_active_userid`
+/// this NEVER falls back to a blocking `loginctl` seat0 lookup, so it is safe to call on an async
+/// runtime thread and on a hot path (e.g. per-frame re-auth): a cache miss returns `None` for the
+/// caller to treat as "active session momentarily unknown" rather than stalling on a subprocess.
+pub fn get_active_userid_cached() -> Option<u32> {
+    get_active_user_id_name_from_cache().and_then(|(uid, _)| uid.parse::<u32>().ok())
 }
 
 fn get_cm() -> bool {
