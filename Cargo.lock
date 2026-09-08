@@ -3632,6 +3632,7 @@ dependencies = [
  "mac_address",
  "machine-uid",
  "osascript",
+ "percent-encoding",
  "protobuf",
  "protobuf-codegen",
  "rand 0.8.5",
