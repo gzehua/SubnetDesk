@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import getpass
 import json
+import os
+import sys
 
 import requests
 
@@ -67,6 +70,23 @@ def check_response(response):
             exit(1)
         return data
     return None
+
+
+def read_token():
+    """API token from $SUBNETDESK_API_TOKEN, else a hidden prompt (or stdin
+    when piped). Never taken from argv, where other local accounts could read
+    it via the process list."""
+    token = os.environ.get("SUBNETDESK_API_TOKEN")
+    if not token:
+        if sys.stdin.isatty():
+            token = getpass.getpass("API token: ")
+        else:
+            token = sys.stdin.readline()
+    token = token.strip()
+    if not token:
+        print("Error: no API token (set SUBNETDESK_API_TOKEN or enter it at the prompt)")
+        exit(1)
+    return token
 
 
 def headers_with(token):
@@ -299,7 +319,6 @@ def main():
         choices=["view", "add", "update", "delete", "view-users", "add-users", "remove-users"],
     )
     parser.add_argument("--url", required=True, help="Server URL")
-    parser.add_argument("--token", required=True, help="API token")
     parser.add_argument("--name", help="Admin role name")
     parser.add_argument("--guid", help="Admin role GUID")
     parser.add_argument("--new-name", help="New admin role name")
@@ -330,6 +349,7 @@ def main():
     )
     parser.set_defaults(unassigned=None)
     args = parser.parse_args()
+    args.token = read_token()
     args.url = args.url.rstrip("/")
 
     if args.command == "view":
