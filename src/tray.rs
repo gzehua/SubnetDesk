@@ -3,6 +3,7 @@ use crate::client::translate;
 use crate::ipc::Data;
 #[cfg(windows)]
 use hbb_common::tokio;
+use base::config::keys;
 use hbb_common::{
     allow_err,
     config::{option2bool, Config, LocalConfig, PeerConfig},
@@ -228,7 +229,7 @@ impl FavoriteMenuState {
 }
 
 pub fn start_tray() {
-    if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+    if crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_TRAY) == "Y" {
         return;
     }
 
@@ -272,11 +273,11 @@ fn make_tray(show_icon: bool) -> hbb_common::ResultType<()> {
     let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
         .context("Failed to open icon")?;
 
-    let mut event_loop = EventLoopBuilder::new().build();
+    let mut event_loop = EventLoopBuilder::<MenuEvent>::with_user_event().build();
 
     let tray_menu = Menu::new();
     let hide_stop_service =
-        crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_STOP_SERVICE)
+        crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_STOP_SERVICE)
             == "Y";
     let open_i = native_menu_item(translate("Open".to_owned()), true, NativeIcon::Computer);
     let favorites_menu = Submenu::new(translate("Favorites".to_owned()), true);
@@ -345,7 +346,6 @@ fn make_tray(show_icon: bool) -> hbb_common::ResultType<()> {
     let session_count = 0;
     let mut last_refresh = Instant::now();
 
-    let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayEvent::receiver();
     #[cfg(windows)]
     let (ipc_sender, ipc_receiver) = std::sync::mpsc::channel::<Data>();
@@ -387,6 +387,19 @@ fn make_tray(show_icon: bool) -> hbb_common::ResultType<()> {
         use tao::platform::macos::EventLoopExtMacOS;
         event_loop.set_activation_policy(tao::platform::macos::ActivationPolicy::Accessory);
     }
+    // tao's Linux backend drives its own loop with a plain `gtk::main_iteration_do(blocking)`
+    // call between polls; it has no GLib timer source tied to `ControlFlow::WaitUntil`, so that
+    // blocking call only wakes for genuine GLib/GTK activity. A menu item's own click delivery
+    // (via muda's global channel) doesn't reliably generate enough of that on its own -- observed
+    // as an "Open"/favorite click doing nothing until some *other* real input event (e.g.
+    // right-clicking to pop the context menu, which pumps plenty of GTK/X11 traffic) happens to
+    // wake the loop and let it drain the channel. Route menu events through a handler that calls
+    // `EventLoopProxy::send_event`, which explicitly wakes the loop via `MainContext::wakeup()`
+    // (glib's own `g_main_context_wakeup`), instead of leaving delivery to chance.
+    let menu_event_proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let _ = menu_event_proxy.send_event(event);
+    }));
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(100),
@@ -402,6 +415,7 @@ fn make_tray(show_icon: bool) -> hbb_common::ResultType<()> {
             // We create the icon once the event loop is actually running
             // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
             let mut builder = TrayIconBuilder::new()
+                .with_id(crate::get_app_name().to_lowercase())
                 .with_menu(Box::new(tray_menu.clone()))
                 .with_tooltip(tooltip(service_enabled, session_count))
                 .with_icon(icon.clone());
@@ -434,7 +448,7 @@ fn make_tray(show_icon: bool) -> hbb_common::ResultType<()> {
             }
         }
 
-        if let Ok(event) = menu_channel.try_recv() {
+        if let tao::event::Event::UserEvent(event) = &event {
             if event.id == open_i.id() {
                 open_func();
             } else if event.id == quit_i.id() {
@@ -462,7 +476,7 @@ fn make_tray(show_icon: bool) -> hbb_common::ResultType<()> {
                     }
                 }
             }
-            if let Some(endpoint) = favorite_menu_state.endpoint_for_event(&event) {
+            if let Some(endpoint) = favorite_menu_state.endpoint_for_event(event) {
                 connect_favorite(endpoint);
             }
         }
